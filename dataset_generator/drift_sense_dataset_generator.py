@@ -1,6 +1,16 @@
 """
-Drift-Sense Track 1 - Synthetic Dataset Generator
+Drift-Sense Track 1 - Synthetic Dataset Generator (v2 - anchor density fix)
 Applied Materials / SEMICON India Hackathon 2026
+
+v2 CHANGELOG:
+  - Fixed: unique anchor features (defects/particles) are now guaranteed to
+    land INSIDE the eventual search crop with a controllable count, instead
+    of being scattered across the full canvas where most crops ended up with
+    zero anchors (causing every sample to hit maximum ambiguity).
+  - Fixed: ambiguity_label now measures actual anchors-in-frame per sample,
+    not a static function of pitch/architecture alone.
+  - New: --anchor_density flag (sparse/medium/dense) for building a real
+    curriculum across difficulty levels.
 
 Generates Reference/Search image pairs for DRAM-style and FinFET-style
 periodic semiconductor layouts, with:
@@ -9,12 +19,14 @@ periodic semiconductor layouts, with:
   - Gaussian/motion blur
   - Rotation + scale jitter
   - Ground-truth (x, y) center of the reference pattern within the search image
-  - Ambiguity label (periodic-peak density) for confidence-head supervision
+  - Per-sample ambiguity label (based on unique-anchor count in frame) for
+    confidence-head supervision
   - Configurable noise severity ('train' vs 'test') so training can be
     deliberately curriculum-shifted toward noisier-than-training test conditions
 
 Usage:
-    python drift_sense_dataset_generator.py --n_pairs 30 --arch both --severity train --out_dir dataset
+    python drift_sense_dataset_generator.py --n_pairs 30 --arch both \
+        --severity train --anchor_density medium --out_dir dataset
 """
 import argparse
 import json
@@ -44,32 +56,37 @@ def generate_dram_layout(size, pitch=40, line_width=6, seed=None):
             sub = layout[y0:y1, x0:x1]
             my, mx = sub.shape
             layout[y0:y1, x0:x1] = np.maximum(sub, via_mask[:my, :mx])
-
-    _add_unique_anchors(layout, rng)
     return layout
 
 
 def generate_finfet_layout(size, fin_pitch=25, fin_width=4, gate_pitch=180, gate_width=15, seed=None):
     """Dense parallel fins crossed by gate bars."""
-    rng = np.random.default_rng(seed)
     layout = np.zeros((size, size), dtype=np.float32)
     for x in range(0, size, fin_pitch):
         layout[:, x:x + fin_width] = 1.0
     for y in range(0, size, gate_pitch):
         layout[y:y + gate_width, :] = np.maximum(layout[y:y + gate_width, :], 0.8)
-
-    _add_unique_anchors(layout, rng)
     return layout
 
 
-def _add_unique_anchors(layout, rng, max_defects=3):
-    """Injects rare non-periodic features (particles/defects) used by the
-    disambiguation stage as unique context anchors."""
+def add_unique_anchors_in_crop(layout, rng, crop_region, min_anchors=3, max_anchors=8):
+    """Injects a controllable number of non-periodic unique features
+    (particles/defects/die-boundary-like marks) guaranteed to land inside
+    the given crop region. This is what the disambiguation stage (annulus
+    context descriptor) keys on to break periodic ambiguity, and what the
+    ambiguity_label is now computed from. Returns the number placed."""
     size = layout.shape[0]
-    n_defects = rng.integers(0, max_defects + 1)
-    for _ in range(n_defects):
-        dx, dy = rng.integers(0, size, 2)
-        dr = rng.integers(3, 8)
+    cx0, cy0, cx1, cy1 = crop_region
+    cx0, cy0 = max(0, cx0), max(0, cy0)
+    cx1, cy1 = min(size, cx1), min(size, cy1)
+    n_anchors = rng.integers(min_anchors, max_anchors + 1)
+    placed = 0
+    for _ in range(n_anchors):
+        if cx1 <= cx0 or cy1 <= cy0:
+            break
+        dx = rng.integers(cx0, cx1)
+        dy = rng.integers(cy0, cy1)
+        dr = rng.integers(4, 10)
         yy, xx = np.ogrid[-dr:dr + 1, -dr:dr + 1]
         mask = xx ** 2 + yy ** 2 <= dr ** 2
         y0, y1 = max(0, dy - dr), min(size, dy + dr + 1)
@@ -77,6 +94,8 @@ def _add_unique_anchors(layout, rng, max_defects=3):
         sub = layout[y0:y1, x0:x1]
         my, mx = sub.shape
         layout[y0:y1, x0:x1] = np.maximum(sub, 0.5 * mask[:my, :mx])
+        placed += 1
+    return placed
 
 
 def apply_edge_brightening(img, halo_width=3, strength=0.6):
@@ -120,7 +139,11 @@ def rotate_scale(img, angle, scale, output_size):
     return zoomed[:output_size, :output_size]
 
 
-def generate_pair(architecture='dram', size=1000, ref_size=100, seed=None, noise_severity='train'):
+_DENSITY_MAP = {'sparse': (1, 3), 'medium': (3, 6), 'dense': (6, 10)}
+
+
+def generate_pair(architecture='dram', size=1000, ref_size=100, seed=None,
+                   noise_severity='train', anchor_density='medium'):
     """Generates one (Reference, Search) pair with ~10x scale relationship
     and ground-truth (x, y) center location of the reference pattern inside
     the search image (search-image pixel coordinates)."""
@@ -141,6 +164,14 @@ def generate_pair(architecture='dram', size=1000, ref_size=100, seed=None, noise
     max_off = ref_size
     search_x0 = int(np.clip(gx - rng.integers(0, max_off), 0, full_size - size))
     search_y0 = int(np.clip(gy - rng.integers(0, max_off), 0, full_size - size))
+
+    lo, hi = _DENSITY_MAP[anchor_density]
+    n_anchors = add_unique_anchors_in_crop(
+        full_layout, rng,
+        (search_x0, search_y0, search_x0 + size, search_y0 + size),
+        min_anchors=lo, max_anchors=hi
+    )
+
     search_full = full_layout[search_y0:search_y0 + size, search_x0:search_x0 + size].copy()
 
     true_x = gx - search_x0 + ref_size // 2
@@ -163,23 +194,28 @@ def generate_pair(architecture='dram', size=1000, ref_size=100, seed=None, noise
         search_full, poisson_scale=p_scale, gaussian_sigma=g_sigma, seed=(seed or 0) + 100000
     )
 
-    approx_peaks_in_frame = (size // pitch) ** 2
-    ambiguity_label = float(min(1.0, approx_peaks_in_frame / 600))
+    # Ambiguity label now reflects actual unique-anchor density in THIS
+    # sample's crop, not a static pitch-derived constant. More anchors in
+    # frame => easier disambiguation => lower ambiguity.
+    ambiguity_label = float(np.clip(1.0 - (n_anchors / 10.0), 0.1, 1.0))
 
     return {
         'reference': reference, 'search': search_full,
         'true_x': int(true_x), 'true_y': int(true_y),
         'architecture': architecture, 'pitch': pitch,
+        'n_anchors_in_frame': n_anchors,
         'ambiguity_label': ambiguity_label,
     }
 
 
-def generate_dataset(n_pairs, out_dir, architectures=('dram', 'finfet'), noise_severity='train', seed0=0):
+def generate_dataset(n_pairs, out_dir, architectures=('dram', 'finfet'),
+                      noise_severity='train', anchor_density='medium', seed0=0):
     os.makedirs(out_dir, exist_ok=True)
     manifest = []
     for i in range(n_pairs):
         arch = architectures[i % len(architectures)] if len(architectures) > 1 else architectures[0]
-        pair = generate_pair(architecture=arch, seed=seed0 + i, noise_severity=noise_severity)
+        pair = generate_pair(architecture=arch, seed=seed0 + i,
+                              noise_severity=noise_severity, anchor_density=anchor_density)
         ref_path = os.path.join(out_dir, f'pair_{i:03d}_ref.npy')
         search_path = os.path.join(out_dir, f'pair_{i:03d}_search.npy')
         np.save(ref_path, pair['reference'].astype(np.float32))
@@ -188,7 +224,9 @@ def generate_dataset(n_pairs, out_dir, architectures=('dram', 'finfet'), noise_s
             'id': i, 'architecture': pair['architecture'],
             'reference_path': ref_path, 'search_path': search_path,
             'true_x': pair['true_x'], 'true_y': pair['true_y'],
-            'ambiguity_label': pair['ambiguity_label'], 'pitch': pair['pitch'],
+            'ambiguity_label': pair['ambiguity_label'],
+            'n_anchors_in_frame': pair['n_anchors_in_frame'],
+            'pitch': pair['pitch'],
         })
     with open(os.path.join(out_dir, 'manifest.json'), 'w') as f:
         json.dump(manifest, f, indent=2)
@@ -200,10 +238,15 @@ if __name__ == '__main__':
     parser.add_argument('--n_pairs', type=int, default=30)
     parser.add_argument('--arch', choices=['dram', 'finfet', 'both'], default='both')
     parser.add_argument('--severity', choices=['train', 'test'], default='train')
+    parser.add_argument('--anchor_density', choices=['sparse', 'medium', 'dense'], default='medium')
     parser.add_argument('--out_dir', default='dataset')
     parser.add_argument('--seed0', type=int, default=0)
     args = parser.parse_args()
 
     archs = ('dram', 'finfet') if args.arch == 'both' else (args.arch,)
-    manifest = generate_dataset(args.n_pairs, args.out_dir, archs, args.severity, args.seed0)
-    print(f"Generated {len(manifest)} pairs in {args.out_dir}/ (severity={args.severity})")
+    manifest = generate_dataset(args.n_pairs, args.out_dir, archs,
+                                 args.severity, args.anchor_density, args.seed0)
+    print(f"Generated {len(manifest)} pairs in {args.out_dir}/ "
+          f"(severity={args.severity}, anchor_density={args.anchor_density})")
+    ambiguities = [m['ambiguity_label'] for m in manifest]
+    print(f"Ambiguity label range: {min(ambiguities):.2f} - {max(ambiguities):.2f}")
