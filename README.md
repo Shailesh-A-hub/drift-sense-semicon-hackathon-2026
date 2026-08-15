@@ -2,6 +2,15 @@
 
 This repository contains a CPU-compatible Dense Zero-Mean Normalized Cross-Correlation (ZNCC) baseline for estimating 2D translation drift between a reference semiconductor image and a shifted query image.
 
+## Current strengths
+
+- **Strong typical-case accuracy:** held-out evaluation achieved a 1.10 px median error, with 88.3% of predictions within 10 px.
+- **Interpretable matching:** ZNCC provides a direct correlation score for every predicted alignment, making the decision process inspectable rather than opaque.
+- **CPU-compatible deployment:** `inference.py` uses OpenCV and NumPy only; a GPU is not required to run inference.
+- **Reproducible workflow:** the repository includes synthetic data generation, a saved evaluation notebook, dependency specification, and a standalone inference entry point.
+- **Verified end-to-end operation:** the script was smoke-tested on a controlled translated image pair and returned the expected reverse alignment correction with a ZNCC score of 0.9999945.
+- **Documented limitations:** the difference between mean and median error indicates hard outlier cases remain; future work will focus on confidence-based rejection, coarse-to-fine search, and robustness to difficult imaging variations.
+
 ## Method
 
 The estimator searches candidate horizontal and vertical translations and selects the alignment with the highest zero-mean normalized cross-correlation score. It returns the correction to apply to the query image so that it aligns with the reference image.
