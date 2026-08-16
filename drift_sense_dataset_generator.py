@@ -150,9 +150,13 @@ def generate_pair(architecture='dram', size=1000, ref_size=100, seed=None, noise
     gy = rng.integers(ref_size, full_size - ref_size)
     reference = full_layout[gy:gy + ref_size, gx:gx + ref_size].copy()
 
-    max_off = ref_size
-    search_x0 = int(np.clip(gx - rng.integers(0, max_off), 0, full_size - size))
-    search_y0 = int(np.clip(gy - rng.integers(0, max_off), 0, full_size - size))
+    # In Applied Materials SEM navigation, the search image field centers around 
+    # the target coordinate with mechanical stage drift (+/- 100 px)
+    drift_x = rng.integers(-80, 81)
+    drift_y = rng.integers(-80, 81)
+    search_x0 = int(np.clip(gx - (size // 2) + drift_x, 0, full_size - size))
+    search_y0 = int(np.clip(gy - (size // 2) + drift_y, 0, full_size - size))
+
     search_full = full_layout[search_y0:search_y0 + size, search_x0:search_x0 + size].copy()
 
     true_x = gx - search_x0 + ref_size // 2
